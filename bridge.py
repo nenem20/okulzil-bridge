@@ -49,7 +49,8 @@ async def handle_school(request):
     finally:
         async with rooms_lock:
             if topic in rooms:
-                rooms[topic]["school_ws"] = None
+                if rooms[topic]["school_ws"] is ws:
+                    rooms[topic]["school_ws"] = None
                 # Bekleyen tüm future'ları hata ile bitir
                 for fut in rooms[topic]["pending"].values():
                     if not fut.done():
