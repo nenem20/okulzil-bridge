@@ -1,113 +1,219 @@
 """
 NeneOkulZil - WebSocket Köprü Sunucusu
-Okul bilgisayarı bu sunucuya bağlanır.
-Telefon bu sunucu üzerinden komut gönderir.
+Okul bilgisayarı bu sunucuya WS ile bağlanır.
+Telefon HTTP API çağrılarını bu sunucuya yapar.
+Sunucu, HTTP isteklerini WS üzerinden okul bilgisayarına iletir ve cevabı döner.
 """
 import asyncio
 import json
 import os
 import time
-import hashlib
-import secrets
+import uuid
 from aiohttp import web, WSMsgType
 
-# Her okul kendi topic'i ile çalışır
-# topic -> {"school_ws": websocket, "clients": [websocket, ...]}
+# topic -> {"school_ws": websocket, "pending": {req_id: Future}}
 rooms = {}
 rooms_lock = asyncio.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
+# ── Okul bilgisayarı WS bağlantısı ──────────────────────────────────────────
 async def handle_school(request):
-    """Okul bilgisayarı buraya bağlanır (server.py)"""
+    """server.py buraya WS ile bağlanır, gelen HTTP isteklerini işler."""
     topic = request.match_info["topic"]
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    
     log(f"Okul bağlandı: {topic}")
-    
+
     async with rooms_lock:
         if topic not in rooms:
-            rooms[topic] = {"school_ws": None, "clients": []}
+            rooms[topic] = {"school_ws": None, "pending": {}}
         rooms[topic]["school_ws"] = ws
-    
+
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
-                # Okuldan gelen mesajları (durum bildirimi vs.) telefona ilet
-                data = msg.data
-                async with rooms_lock:
-                    if topic in rooms:
-                        dead = []
-                        for client_ws in rooms[topic]["clients"]:
-                            try:
-                                await client_ws.send_str(data)
-                            except:
-                                dead.append(client_ws)
-                        for d in dead:
-                            rooms[topic]["clients"].remove(d)
+                try:
+                    data = json.loads(msg.data)
+                    req_id = data.get("_req_id")
+                    if req_id:
+                        async with rooms_lock:
+                            fut = rooms.get(topic, {}).get("pending", {}).pop(req_id, None)
+                        if fut and not fut.done():
+                            fut.set_result(data)
+                except Exception as e:
+                    log(f"Okul mesaj hatası: {e}")
             elif msg.type == WSMsgType.ERROR:
-                log(f"Okul WS hatası: {topic}")
                 break
     finally:
         async with rooms_lock:
             if topic in rooms:
                 rooms[topic]["school_ws"] = None
+                # Bekleyen tüm future'ları hata ile bitir
+                for fut in rooms[topic]["pending"].values():
+                    if not fut.done():
+                        fut.set_exception(Exception("Okul bağlantısı kesildi"))
+                rooms[topic]["pending"].clear()
         log(f"Okul ayrıldı: {topic}")
-    
     return ws
 
-async def handle_remote(request):
-    """Telefon buraya bağlanır (remote.html)"""
+# ── Proxy: HTTP → WS → HTTP ─────────────────────────────────────────────────
+async def handle_proxy(request):
+    """Telefondan gelen HTTP isteğini WS üzerinden okul PC'ye iletir."""
+    topic    = request.match_info["topic"]
+    endpoint = "/" + request.match_info["endpoint"]
+    qs       = request.query_string
+
+    async with rooms_lock:
+        room = rooms.get(topic)
+        school_ws = room["school_ws"] if room else None
+
+    if not school_ws or school_ws.closed:
+        return web.json_response(
+            {"ok": False, "error": "Okul bilgisayarı bağlı değil"},
+            status=503,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+
+    req_id = str(uuid.uuid4())[:8]
+    loop   = asyncio.get_event_loop()
+    fut    = loop.create_future()
+
+    async with rooms_lock:
+        rooms[topic]["pending"][req_id] = fut
+
+    # İsteği paketle
+    method = request.method
+    body   = {}
+    if method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    packet = {
+        "_req_id":  req_id,
+        "_method":  method,
+        "_endpoint": endpoint,
+        "_qs":      qs,
+        **body
+    }
+
+    try:
+        await school_ws.send_str(json.dumps(packet, ensure_ascii=False))
+        result = await asyncio.wait_for(fut, timeout=10.0)
+        result.pop("_req_id", None)
+        status = result.pop("_status", 200)
+        return web.json_response(result, status=status,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    except asyncio.TimeoutError:
+        async with rooms_lock:
+            rooms.get(topic, {}).get("pending", {}).pop(req_id, None)
+        return web.json_response(
+            {"ok": False, "error": "Okul bilgisayarı cevap vermedi"},
+            status=504,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except Exception as e:
+        return web.json_response(
+            {"ok": False, "error": str(e)},
+            status=500,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+
+# ── SSE proxy ────────────────────────────────────────────────────────────────
+async def handle_sse_proxy(request):
+    """SSE bağlantısını köprü üzerinden okul PC'ye iletir."""
     topic = request.match_info["topic"]
-    ws = web.WebSocketResponse(heartbeat=30)
-    await ws.prepare(request)
-    
-    log(f"Telefon bağlandı: {topic}")
-    
+    pin   = request.rel_url.query.get("pin", "")
+
+    async with rooms_lock:
+        room = rooms.get(topic)
+        school_ws = room["school_ws"] if room else None
+
+    if not school_ws or school_ws.closed:
+        return web.Response(
+            status=503,
+            text="data: {\"error\": \"Okul bağlı değil\"}\n\n",
+            content_type="text/event-stream"
+        )
+
+    response = web.StreamResponse(headers={
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*"
+    })
+    await response.prepare(request)
+
+    # SSE kuyruğu: okul PC'den gelen SSE mesajları buraya düşer
+    sse_queue = asyncio.Queue(maxsize=50)
+
+    sse_id = f"sse_{uuid.uuid4().hex[:8]}"
     async with rooms_lock:
         if topic not in rooms:
-            rooms[topic] = {"school_ws": None, "clients": []}
-        rooms[topic]["clients"].append(ws)
-    
+            rooms[topic] = {"school_ws": None, "pending": {}}
+        rooms[topic].setdefault("sse_clients", {})[sse_id] = sse_queue
+
+    # Okul PC'ye SSE başlat bildirimi gönder
+    await school_ws.send_str(json.dumps({
+        "_sse_start": True,
+        "_sse_id": sse_id,
+        "pin": pin
+    }))
+
     try:
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                # Telefondan gelen komutları okul bilgisayarına ilet
-                async with rooms_lock:
-                    if topic in rooms and rooms[topic]["school_ws"]:
-                        try:
-                            await rooms[topic]["school_ws"].send_str(msg.data)
-                        except:
-                            rooms[topic]["school_ws"] = None
-                            log(f"Okul bağlantısı koptu: {topic}")
-            elif msg.type == WSMsgType.ERROR:
-                break
+        await response.write(b"event: connected\ndata: {}\n\n")
+        while True:
+            try:
+                msg = await asyncio.wait_for(sse_queue.get(), timeout=25)
+                await response.write(msg.encode())
+            except asyncio.TimeoutError:
+                await response.write(b": keepalive\n\n")
+    except Exception:
+        pass
     finally:
         async with rooms_lock:
-            if topic in rooms and ws in rooms[topic]["clients"]:
-                rooms[topic]["clients"].remove(ws)
-        log(f"Telefon ayrıldı: {topic}")
-    
-    return ws
+            rooms.get(topic, {}).get("sse_clients", {}).pop(sse_id, None)
+        try:
+            await school_ws.send_str(json.dumps({"_sse_stop": True, "_sse_id": sse_id}))
+        except Exception:
+            pass
 
+    return response
+
+# ── OPTIONS (CORS) ───────────────────────────────────────────────────────────
+async def handle_options(request):
+    return web.Response(headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Api-Token, X-Remote-Pin"
+    })
+
+# ── Durum / sağlık ───────────────────────────────────────────────────────────
 async def handle_status(request):
-    """Okul bağlı mı kontrol et"""
     topic = request.match_info["topic"]
     async with rooms_lock:
         room = rooms.get(topic)
-        connected = room is not None and room["school_ws"] is not None
-    return web.json_response({"connected": connected, "topic": topic})
+        connected = room is not None and room.get("school_ws") is not None
+    return web.json_response(
+        {"connected": connected, "topic": topic},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 async def handle_health(request):
     return web.json_response({"ok": True, "rooms": len(rooms)})
 
+# ── Uygulama ─────────────────────────────────────────────────────────────────
 app = web.Application()
-app.router.add_get("/ws/school/{topic}", handle_school)
-app.router.add_get("/ws/remote/{topic}", handle_remote)
-app.router.add_get("/status/{topic}", handle_status)
-app.router.add_get("/health", handle_health)
+app.router.add_get ("/ws/school/{topic}",               handle_school)
+app.router.add_get ("/status/{topic}",                  handle_status)
+app.router.add_get ("/health",                          handle_health)
+app.router.add_get ("/proxy/{topic}/api/remote/sse",    handle_sse_proxy)
+app.router.add_get ("/proxy/{topic}/{endpoint:.*}",     handle_proxy)
+app.router.add_post("/proxy/{topic}/{endpoint:.*}",     handle_proxy)
+app.router.add_route("OPTIONS", "/proxy/{topic}/{endpoint:.*}", handle_options)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
