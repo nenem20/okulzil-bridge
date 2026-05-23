@@ -22,7 +22,7 @@ def log(msg):
 async def handle_school(request):
     """server.py buraya WS ile bağlanır, gelen HTTP isteklerini işler."""
     topic = request.match_info["topic"]
-    ws = web.WebSocketResponse(heartbeat=30)
+    ws = web.WebSocketResponse(heartbeat=15)
     await ws.prepare(request)
     log(f"Okul bağlandı: {topic}")
 
