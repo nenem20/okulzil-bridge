@@ -22,7 +22,7 @@ def log(msg):
 async def handle_school(request):
     """server.py buraya WS ile bağlanır, gelen HTTP isteklerini işler."""
     topic = request.match_info["topic"]
-    ws = web.WebSocketResponse(heartbeat=15)
+    ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     log(f"Okul bağlandı: {topic}")
 
@@ -51,11 +51,11 @@ async def handle_school(request):
             if topic in rooms:
                 if rooms[topic]["school_ws"] is ws:
                     rooms[topic]["school_ws"] = None
-                # Bekleyen tüm future'ları hata ile bitir
-                for fut in rooms[topic]["pending"].values():
-                    if not fut.done():
-                        fut.set_exception(Exception("Okul bağlantısı kesildi"))
-                rooms[topic]["pending"].clear()
+                    # Yalnızca bu WS aktifken gelen bekleyen istekleri iptal et
+                    for fut in rooms[topic]["pending"].values():
+                        if not fut.done():
+                            fut.set_exception(Exception("Okul bağlantısı kesildi"))
+                    rooms[topic]["pending"].clear()
         log(f"Okul ayrıldı: {topic}")
     return ws
 
@@ -66,11 +66,19 @@ async def handle_proxy(request):
     endpoint = "/" + request.match_info["endpoint"]
     qs       = request.query_string
 
-    async with rooms_lock:
-        room = rooms.get(topic)
-        school_ws = room["school_ws"] if room else None
+    # WS yeni bağlanıyor / yeniden bağlanıyor olabilir — 8 saniye bekle
+    school_ws = None
+    for attempt in range(4):
+        async with rooms_lock:
+            room = rooms.get(topic)
+            sw = room["school_ws"] if room else None
+        if sw and not sw.closed:
+            school_ws = sw
+            break
+        if attempt < 3:
+            await asyncio.sleep(2)
 
-    if not school_ws or school_ws.closed:
+    if not school_ws:
         return web.json_response(
             {"ok": False, "error": "Okul bilgisayarı bağlı değil"},
             status=503,
@@ -197,7 +205,8 @@ async def handle_status(request):
     topic = request.match_info["topic"]
     async with rooms_lock:
         room = rooms.get(topic)
-        connected = room is not None and room.get("school_ws") is not None
+        sw = room.get("school_ws") if room else None
+        connected = sw is not None and not sw.closed
     return web.json_response(
         {"connected": connected, "topic": topic},
         headers={"Access-Control-Allow-Origin": "*"}
