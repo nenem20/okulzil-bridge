@@ -72,15 +72,20 @@ async def handle_proxy(request):
         async with rooms_lock:
             room = rooms.get(topic)
             sw = room["school_ws"] if room else None
-        state = "None" if sw is None else ("closed" if sw.closed else "open")
-        log(f"Proxy deneme {attempt+1}: school_ws={state} topic={topic}")
-        if sw and not sw.closed:
+        if sw is None:
+            state = "None"
+        elif sw.closed:
+            state = "closed"
+        else:
+            state = "open"
+        log(f"Proxy deneme {attempt+1}: school_ws={state} bool={bool(sw) if sw is not None else 'N/A'} topic={topic}")
+        if sw is not None and not sw.closed:
             school_ws = sw
             break
         if attempt < 3:
             await asyncio.sleep(2)
 
-    if not school_ws:
+    if school_ws is None:
         return web.json_response(
             {"ok": False, "error": "Okul bilgisayarı bağlı değil"},
             status=503,
