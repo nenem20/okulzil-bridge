@@ -72,6 +72,8 @@ async def handle_proxy(request):
         async with rooms_lock:
             room = rooms.get(topic)
             sw = room["school_ws"] if room else None
+        state = "None" if sw is None else ("closed" if sw.closed else "open")
+        log(f"Proxy deneme {attempt+1}: school_ws={state} topic={topic}")
         if sw and not sw.closed:
             school_ws = sw
             break
@@ -215,11 +217,23 @@ async def handle_status(request):
 async def handle_health(request):
     return web.json_response({"ok": True, "rooms": len(rooms)})
 
+async def handle_debug(request):
+    async with rooms_lock:
+        out = {}
+        for t, room in rooms.items():
+            ws = room.get("school_ws")
+            out[t] = {
+                "school_ws": "None" if ws is None else ("closed" if ws.closed else "OPEN"),
+                "pending": len(room.get("pending", {})),
+            }
+    return web.json_response(out, headers={"Access-Control-Allow-Origin": "*"})
+
 # ── Uygulama ─────────────────────────────────────────────────────────────────
 app = web.Application()
 app.router.add_get ("/ws/school/{topic}",               handle_school)
 app.router.add_get ("/status/{topic}",                  handle_status)
 app.router.add_get ("/health",                          handle_health)
+app.router.add_get ("/debug",                           handle_debug)
 app.router.add_get ("/proxy/{topic}/api/remote/sse",    handle_sse_proxy)
 app.router.add_get ("/proxy/{topic}/{endpoint:.*}",     handle_proxy)
 app.router.add_post("/proxy/{topic}/{endpoint:.*}",     handle_proxy)
