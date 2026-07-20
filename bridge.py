@@ -66,6 +66,23 @@ async def handle_proxy(request):
     endpoint = "/" + request.match_info["endpoint"]
     qs       = request.query_string
 
+    # ── Guvenlik: kopru YALNIZCA /api/remote/* uclarini gecirir ──────────────
+    # Okul PC'si (server.py) gelen _endpoint'i oldugu gibi kendi 127.0.0.1'ine
+    # iletir. Oradaki yetki sinirlari: /api/remote/* -> PIN, diger /api/* ->
+    # API_TOKEN, statik dosyalar -> HIC KONTROL YOK (do_GET yalnizca "/api/" ile
+    # baslayanlari kontrol eder). Kopru token tasimadigi icin /api/* zaten 403
+    # alir; asil acik statik GET'lerdi (/index.html vb.) — ntfy topic'ini bilen
+    # herkes cekebilirdi. Sinir bu yuzden kopru kenarinda da uygulanir.
+    # ".." ayrica reddedilir: "/api/remote/../index.html" oneki gecer ama
+    # urllib istegi normallestirince whitelist disina cikardi.
+    if not endpoint.startswith("/api/remote/") or ".." in endpoint:
+        log(f"Proxy REDDEDILDI (whitelist disi): {endpoint} topic={topic}")
+        return web.json_response(
+            {"ok": False, "error": "Bu uc kopru uzerinden kullanilamaz"},
+            status=403,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+
     # WS yeni bağlanıyor / yeniden bağlanıyor olabilir — 8 saniye bekle
     school_ws = None
     for attempt in range(4):
