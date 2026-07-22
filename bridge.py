@@ -133,6 +133,15 @@ async def handle_proxy(request):
         **body
     }
 
+    # K-7 (adim 1): PIN'i adres satirindan (?pin=) cikarabilmek icin telefonun
+    # X-Remote-Pin header'ini pakete tasi. EK ozellik, mevcut akisi BOZMAZ:
+    # govde/qs'te pin varsa dokunulmaz; header YALNIZCA pakette pin yokken doldurur.
+    # (server.py packet["pin"]'i okur; boylece GET'lerde de PIN header'dan gecebilir.)
+    if not packet.get("pin"):
+        hdr_pin = request.headers.get("X-Remote-Pin", "")
+        if hdr_pin:
+            packet["pin"] = hdr_pin
+
     try:
         await school_ws.send_str(json.dumps(packet, ensure_ascii=False))
         result = await asyncio.wait_for(fut, timeout=10.0)
