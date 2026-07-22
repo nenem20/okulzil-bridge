@@ -24,12 +24,23 @@ async def handle_school(request):
     topic = request.match_info["topic"]
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    log(f"Okul bağlandı: {topic}")
 
     async with rooms_lock:
+        room = rooms.get(topic)
+        mevcut = room["school_ws"] if room else None
+        # K-7 (P2/b): bu topic'e ZATEN CANLI bir okul bagliysa yeni baglantiyi
+        # REDDET. Boylece topic'i bilen biri bagli gercek okulu "ele geciremez"
+        # (eskiden son baglanan slotu ezip okulun yerine geciyordu). Gercek okul
+        # koparsa asagidaki finally school_ws'i None yapar VE heartbeat=30s olu
+        # baglantiyi ~30sn'de temizler -> okul sonra sorunsuz yeniden baglanir.
+        if mevcut is not None and not mevcut.closed:
+            log(f"Okul REDDEDILDI (bu topic'e zaten bagli): {topic}")
+            await ws.close(code=4001, message=b"already-connected")
+            return ws
         if topic not in rooms:
             rooms[topic] = {"school_ws": None, "pending": {}}
         rooms[topic]["school_ws"] = ws
+    log(f"Okul bağlandı: {topic}")
 
     try:
         async for msg in ws:
